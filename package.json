@@ -27,9 +27,14 @@
   "license": "ISC",
   "dependencies": {
     "express": "^4.19.2",
+    "fs-extra": "^11.3.4",
+    "mpq": "^0.0.1",
     "multer": "^1.4.5-lts.1",
+    "node-mpq": "^0.0.0",
     "nodemon": "^3.1.1",
     "portfinder": "^1.0.32",
-    "w3gjs": "^2.5.0"
+    "w3gjs": "^2.5.0",
+    "w3x-parser": "^2.0.0",
+    "wc3maptranslator": "^5.0.0"
   }
 }

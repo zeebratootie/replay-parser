@@ -46,7 +46,8 @@ portfinder.getPortPromise()
 
                 try {
                     const filePath = req.file.path;
-                    let result = await parseW3G(filePath);
+                    const debug = req.query.debug === '1' || req.query.debug === 'true';
+                    let result = await parseW3G(filePath, { debug });
 
                     res.send(result);
                 } catch (error) {
