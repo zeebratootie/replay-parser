@@ -75,7 +75,12 @@ async function parseW3G(filepath, options = {}) {
         let items = [];
         let purchases = [];
         let itemActions = [];
-        let playerHeroes = {}; // Track heroes by player
+        let playerHeroes = {}; // Final hero per player (resolved after parse)
+        let heroCodeCounts = {}; // playerId -> { HEROCODE: count }, frequency fallback
+        let heroByHfoo = {}; // playerId -> { sawHfoo, confirmed } for the primary
+                             // signal: the FIRST hero code that appears after the
+                             // player's starting footman (hfoo) is that player's hero
+                             // (it is typically the unit they then right-click to move).
         let rawActionLog = []; // debug: catch-all for action IDs 16-20
 
         parser.on("basic_replay_information", (info) => {
@@ -110,35 +115,13 @@ async function parseW3G(filepath, options = {}) {
                 if (extractedName !== null && extractedName !== player.playerName) {
                     player.convertedName = `${extractedName}(${player.playerName})`
                 }
-                
-                // Track hero assignment based on the bytes of the -load code
-                // Code is often "-load H006..." or "-load 1234..."
-                if (block.message && block.message.toLowerCase().startsWith('-load ')) {
-                    const loadString = block.message.substring(6).trim(); // Remove "-load "
-                    
-                    // The user's load string actually starts with a hashed code, but when decoded or verified in memory it matches the hero ID.
-                    // The easiest and most accurate way (as requested) is to decode the base64/hex bytes of the load string,
-                    // but since the original request said "convert all bytes from -load and find the first hero id from all the load code"
-                    // We will parse the -load command string as a byte array and look for the Hero ID (e.g., 'H006') hidden inside it!
-                    
-                    const loadBytes = Buffer.from(loadString, 'utf-8'); // or ascii depending on encoding
-                    const loadStringConverted = loadBytes.toString('utf-8');
 
-                    for (const code of Object.keys(TWRPG_HEROES)) {
-                        // Look for the hero ID anywhere in the load string
-                        if (loadStringConverted.includes(code)) {
-                            if (!playerHeroes[block.playerId]) {
-                                playerHeroes[block.playerId] = {
-                                    code: code,
-                                    name: TWRPG_HEROES[code],
-                                    time: time,
-                                    source: 'chat_load_bytes'
-                                };
-                            }
-                            break;
-                        }
-                    }
-                }
+                // NOTE: we intentionally do NOT derive the hero from the -load
+                // save code. The save code is an opaque hashed string; scanning it
+                // for a 4-char hero id produced false matches (any hero code that
+                // coincidentally appeared as a substring), which mis-tagged
+                // players. The hero is now detected purely from in-game action
+                // frequency (see heroCodeCounts below).
             }
 
             // user action
@@ -151,21 +134,47 @@ async function parseW3G(filepath, options = {}) {
                     const playerId = commandBlock.playerId;
                     
                     commandBlock.actions.forEach(action => {
-                        // Track any action that contains an itemId that matches a valid hero code
-                        // E.g. placing the 'hero' unit or getting the item representing it
-                        if (action.itemId && Array.isArray(action.itemId)) {
-                            const unitCode = convertBytesToFourCC(action.itemId);
+                        // Frequency-based hero detection: count every reference to a
+                        // valid hero unit code in THIS player's command blocks. A
+                        // player issues orders to their own hero constantly, so the
+                        // hero they reference most is their hero. This is robust
+                        // against one-off global/shared events that previously
+                        // mis-tagged a player from the first code seen.
+                        const toHeroCode = (arr) => {
+                            if (!Array.isArray(arr)) return null;
+                            const code = convertBytesToFourCC(arr);
+                            if (!code || !/^[A-Za-z0-9]{4}$/.test(code)) return null;
+                            return code.toUpperCase();
+                        };
+                        const countHeroCode = (arr) => {
+                            const upper = toHeroCode(arr);
+                            if (upper && TWRPG_HEROES[upper] && upper !== 'HFOO') {
+                                if (!heroCodeCounts[playerId]) heroCodeCounts[playerId] = {};
+                                heroCodeCounts[playerId][upper] = (heroCodeCounts[playerId][upper] || 0) + 1;
+                            }
+                        };
+                        countHeroCode(action.itemId);
+                        countHeroCode(action.itemId1);
+                        countHeroCode(action.itemId2);
+                        if (Array.isArray(action.actions)) {
+                            action.actions.forEach(sub => {
+                                countHeroCode(sub.itemId1);
+                                countHeroCode(sub.itemId2);
+                            });
+                        }
 
-                            if (TWRPG_HEROES[unitCode] && unitCode !== 'hfoo') {
-                                // Normally, only capture the first time they trigger a hero
-                                // But prevent capturing other people's global events if they haven't loaded
-                                if (!playerHeroes[playerId] || playerHeroes[playerId].source !== 'action_select') {
-                                    playerHeroes[playerId] = {
-                                        code: unitCode,
-                                        name: TWRPG_HEROES[unitCode],
-                                        time: time,
-                                        source: 'action_create'
-                                    };
+                        // Primary signal: the first hero code seen after the
+                        // player's starting footman (hfoo) is their hero.
+                        const st = heroByHfoo[playerId] || (heroByHfoo[playerId] = { sawHfoo: false, confirmed: null });
+                        if (!st.confirmed) {
+                            const c0 = toHeroCode(action.itemId);
+                            const c1 = toHeroCode(action.itemId1);
+                            const c2 = toHeroCode(action.itemId2);
+                            if (c0 === 'HFOO' || c1 === 'HFOO' || c2 === 'HFOO') {
+                                st.sawHfoo = true;
+                            } else if (st.sawHfoo) {
+                                for (const c of [c0, c1, c2]) {
+                                    if (c && TWRPG_HEROES[c] && c !== 'HFOO') { st.confirmed = c; break; }
                                 }
                             }
                         }
@@ -202,42 +211,13 @@ async function parseW3G(filepath, options = {}) {
                                 field: fieldName,
                                 itemId: itemId
                             });
-
-                            // Detect hero load from item code and assign hero name to player data.
-                            // IMPORTANT: only real hero codes (from heros.json) may be recorded as
-                            // the player's hero. resolveHeroName also resolves normal items, so
-                            // using it here let any looted item (e.g. "Twisted Fragment of Ruins")
-                            // overwrite the player's real hero. We also keep the first hero seen
-                            // rather than letting later item actions clobber it.
-                            const heroCode = (itemId || '').toUpperCase();
-                            if (TWRPG_HEROES[heroCode] && heroCode !== 'HFOO' && !playerHeroes[playerId]) {
-                                playerHeroes[playerId] = {
-                                    code: itemId,
-                                    name: TWRPG_HEROES[heroCode],
-                                    time: time,
-                                    source: 'action_hero'
-                                };
-                            }
+                            // (Hero detection happens via frequency counting above,
+                            // not from individual item-action codes.)
                         };
 
                         collectItemAction('itemId', action.itemId);
                         collectItemAction('itemId1', action.itemId1);
                         collectItemAction('itemId2', action.itemId2);
-
-                        // Track Action 22 (Select unit)
-                        // If a player selects a unit, we are highly confident they own it.
-                        // This fixes bugs where global events tag someone incorrectly.
-                        if (action.id === 22 && action.itemId1 && Array.isArray(action.itemId1)) {
-                            const unitCode = convertBytesToFourCC(action.itemId1);
-                            if (TWRPG_HEROES[unitCode] && unitCode !== 'hfoo') {
-                                playerHeroes[playerId] = {
-                                    code: unitCode,
-                                    name: TWRPG_HEROES[unitCode],
-                                    time: time,
-                                    source: 'action_select'
-                                };
-                            }
-                        }
 
                         // Debug: catch-all for ALL action types that carry item/unit fields
                         // Expanded beyond 16-20 to catch: 0x13 (give item), 0x1C (pick up ground item), 0x16 (selection)
@@ -351,6 +331,39 @@ async function parseW3G(filepath, options = {}) {
                 return null;
             }
         }).filter(e => e !== null);
+
+        // Resolve each player's hero. Primary: the first hero taken control of
+        // after the starting footman, confirmed by a following right-click
+        // (heroByHfoo). Fallback: the hero code referenced most often in the
+        // player's own command blocks (heroCodeCounts).
+        const allPlayerIds = new Set([
+            ...Object.keys(heroByHfoo),
+            ...Object.keys(heroCodeCounts),
+        ]);
+        allPlayerIds.forEach(playerId => {
+            const confirmed = heroByHfoo[playerId] && heroByHfoo[playerId].confirmed;
+            if (confirmed) {
+                playerHeroes[playerId] = {
+                    code: confirmed,
+                    name: TWRPG_HEROES[confirmed],
+                    source: 'hfoo_rightclick'
+                };
+                return;
+            }
+            const counts = heroCodeCounts[playerId];
+            if (counts) {
+                const ranked = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+                if (ranked.length > 0) {
+                    const [code, count] = ranked[0];
+                    playerHeroes[playerId] = {
+                        code: code,
+                        name: TWRPG_HEROES[code],
+                        count: count,
+                        source: 'action_frequency'
+                    };
+                }
+            }
+        });
 
         // Merge hero data into playerData, attaching the hero's class
         const playerDataWithHeroes = playerData.map(player => {
