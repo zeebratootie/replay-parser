@@ -77,10 +77,11 @@ async function parseW3G(filepath, options = {}) {
         let itemActions = [];
         let playerHeroes = {}; // Final hero per player (resolved after parse)
         let heroCodeCounts = {}; // playerId -> { HEROCODE: count }, frequency fallback
-        let heroByHfoo = {}; // playerId -> { sawHfoo, confirmed } for the primary
-                             // signal: the FIRST hero code that appears after the
-                             // player's starting footman (hfoo) is that player's hero
-                             // (it is typically the unit they then right-click to move).
+        let heroByHfoo = {}; // playerId -> { sawHfoo, confirmed }: the first hero
+                             // code seen after the player's starting footman (hfoo).
+                             // Used only as a FALLBACK when frequency has no data —
+                             // on its own it can grab a stray (another player's hero
+                             // seen first), so heroCodeCounts is the primary signal.
         let rawActionLog = []; // debug: catch-all for action IDs 16-20
 
         parser.on("basic_replay_information", (info) => {
@@ -163,8 +164,9 @@ async function parseW3G(filepath, options = {}) {
                             });
                         }
 
-                        // Primary signal: the first hero code seen after the
-                        // player's starting footman (hfoo) is their hero.
+                        // Fallback signal: the first hero code seen after the
+                        // player's starting footman (hfoo). Only used when the
+                        // frequency count has no data for this player.
                         const st = heroByHfoo[playerId] || (heroByHfoo[playerId] = { sawHfoo: false, confirmed: null });
                         if (!st.confirmed) {
                             const c0 = toHeroCode(action.itemId);
@@ -332,24 +334,22 @@ async function parseW3G(filepath, options = {}) {
             }
         }).filter(e => e !== null);
 
-        // Resolve each player's hero. Primary: the first hero taken control of
-        // after the starting footman, confirmed by a following right-click
-        // (heroByHfoo). Fallback: the hero code referenced most often in the
-        // player's own command blocks (heroCodeCounts).
+        // Resolve each player's hero. Primary: the hero code the player
+        // referenced MOST in their own command blocks (heroCodeCounts) — a
+        // player commands their own hero far more than any stray code. Fallback:
+        // the first hero seen after their starting footman (heroByHfoo), used
+        // only when no hero codes were counted at all.
+        //
+        // NOTE: "first hero after the footman" is NOT reliable on its own — in a
+        // populated game the first hero code after the footman is often a stray
+        // (a brief interaction with another player's hero or an interleaved
+        // startup event), so it could mis-tag e.g. a Wind Mage as Martial Artist.
+        // Frequency is robust because the player's real hero dominates the count.
         const allPlayerIds = new Set([
             ...Object.keys(heroByHfoo),
             ...Object.keys(heroCodeCounts),
         ]);
         allPlayerIds.forEach(playerId => {
-            const confirmed = heroByHfoo[playerId] && heroByHfoo[playerId].confirmed;
-            if (confirmed) {
-                playerHeroes[playerId] = {
-                    code: confirmed,
-                    name: TWRPG_HEROES[confirmed],
-                    source: 'hfoo_rightclick'
-                };
-                return;
-            }
             const counts = heroCodeCounts[playerId];
             if (counts) {
                 const ranked = Object.entries(counts).sort((a, b) => b[1] - a[1]);
@@ -361,7 +361,16 @@ async function parseW3G(filepath, options = {}) {
                         count: count,
                         source: 'action_frequency'
                     };
+                    return;
                 }
+            }
+            const confirmed = heroByHfoo[playerId] && heroByHfoo[playerId].confirmed;
+            if (confirmed) {
+                playerHeroes[playerId] = {
+                    code: confirmed,
+                    name: TWRPG_HEROES[confirmed],
+                    source: 'hfoo_first'
+                };
             }
         });
 
