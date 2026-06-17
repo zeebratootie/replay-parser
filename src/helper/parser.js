@@ -76,12 +76,8 @@ async function parseW3G(filepath, options = {}) {
         let purchases = [];
         let itemActions = [];
         let playerHeroes = {}; // Final hero per player (resolved after parse)
-        let heroCodeCounts = {}; // playerId -> { HEROCODE: count }, frequency fallback
-        let heroByHfoo = {}; // playerId -> { sawHfoo, confirmed }: the first hero
-                             // code seen after the player's starting footman (hfoo).
-                             // Used only as a FALLBACK when frequency has no data —
-                             // on its own it can grab a stray (another player's hero
-                             // seen first), so heroCodeCounts is the primary signal.
+        let heroCodeCounts = {}; // playerId -> { HEROCODE: count }; the hero a player
+                                 // references most in their own command blocks is theirs.
         let rawActionLog = []; // debug: catch-all for action IDs 16-20
 
         parser.on("basic_replay_information", (info) => {
@@ -162,23 +158,6 @@ async function parseW3G(filepath, options = {}) {
                                 countHeroCode(sub.itemId1);
                                 countHeroCode(sub.itemId2);
                             });
-                        }
-
-                        // Fallback signal: the first hero code seen after the
-                        // player's starting footman (hfoo). Only used when the
-                        // frequency count has no data for this player.
-                        const st = heroByHfoo[playerId] || (heroByHfoo[playerId] = { sawHfoo: false, confirmed: null });
-                        if (!st.confirmed) {
-                            const c0 = toHeroCode(action.itemId);
-                            const c1 = toHeroCode(action.itemId1);
-                            const c2 = toHeroCode(action.itemId2);
-                            if (c0 === 'HFOO' || c1 === 'HFOO' || c2 === 'HFOO') {
-                                st.sawHfoo = true;
-                            } else if (st.sawHfoo) {
-                                for (const c of [c0, c1, c2]) {
-                                    if (c && TWRPG_HEROES[c] && c !== 'HFOO') { st.confirmed = c; break; }
-                                }
-                            }
                         }
 
                         // Collect any item-related action IDs for this player
@@ -334,42 +313,19 @@ async function parseW3G(filepath, options = {}) {
             }
         }).filter(e => e !== null);
 
-        // Resolve each player's hero. Primary: the hero code the player
-        // referenced MOST in their own command blocks (heroCodeCounts) — a
-        // player commands their own hero far more than any stray code. Fallback:
-        // the first hero seen after their starting footman (heroByHfoo), used
-        // only when no hero codes were counted at all.
-        //
-        // NOTE: "first hero after the footman" is NOT reliable on its own — in a
-        // populated game the first hero code after the footman is often a stray
-        // (a brief interaction with another player's hero or an interleaved
-        // startup event), so it could mis-tag e.g. a Wind Mage as Martial Artist.
-        // Frequency is robust because the player's real hero dominates the count.
-        const allPlayerIds = new Set([
-            ...Object.keys(heroByHfoo),
-            ...Object.keys(heroCodeCounts),
-        ]);
-        allPlayerIds.forEach(playerId => {
-            const counts = heroCodeCounts[playerId];
-            if (counts) {
-                const ranked = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-                if (ranked.length > 0) {
-                    const [code, count] = ranked[0];
-                    playerHeroes[playerId] = {
-                        code: code,
-                        name: TWRPG_HEROES[code],
-                        count: count,
-                        source: 'action_frequency'
-                    };
-                    return;
-                }
-            }
-            const confirmed = heroByHfoo[playerId] && heroByHfoo[playerId].confirmed;
-            if (confirmed) {
+        // Resolve each player's hero: the hero code they referenced MOST in their
+        // own command blocks. A player commands their own hero far more than any
+        // stray code, so this is robust. If no hero codes were counted for a
+        // player, they get no hero (the consumer falls back to other signals).
+        Object.keys(heroCodeCounts).forEach(playerId => {
+            const ranked = Object.entries(heroCodeCounts[playerId]).sort((a, b) => b[1] - a[1]);
+            if (ranked.length > 0) {
+                const [code, count] = ranked[0];
                 playerHeroes[playerId] = {
-                    code: confirmed,
-                    name: TWRPG_HEROES[confirmed],
-                    source: 'hfoo_first'
+                    code: code,
+                    name: TWRPG_HEROES[code],
+                    count: count,
+                    source: 'action_frequency'
                 };
             }
         });
